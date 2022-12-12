@@ -1,0 +1,30 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2580
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;\f1\fswiss\fcharset0 Helvetica-Bold;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 Henry Kanengiser\
+Assignment 3\
+Documenting the steps I took in QGIS\
+\
+First, I had to fix the geometries in the 3 flood maps because they each had invalid geometries. I did this using the \'93fix geometries\'94 function.\
+\
+Then, I used the \'93Select by Location\'94 tool to select the PLUTO tax lots that intersected with the sea level map and saved the selected polygons as a new shapefile\
+\
+\ul Creating full universe of lots shapefile\ulnone \
+Goal: create one shapefile that contains all BBLs and spatial geometry of NYC building lots that fall into any of the three flood zones.\
+\
+First, I compared the 3 PLUTO plots that intersect with each flood zone map to see if all lots in the current flood map (and 100-year 2050 map) fall into the 500-year 2050 map. Almost all of them do, but not all. There are 3 lots in the 2050 100-year flood zone but not in the 500-year. I extracted a layer including these 3 records to join later.\
+\
+Then, I deleted all rows besides BBL and a flag I created in each PLUTO layer that flagged presence in that flood zone in the smaller two flood zones (fp20_100y & fp50_100y). \
+\
+Using these simplified versions of the layers, I joined each of these layers to the 2050 500-year map using BBLs. I then combined that layer with the layer containing 3 records not in the 2050 500-year flood zone map and saved this as the final shapefile universe for this analysis.\
+\
+This layer includes every lot included in any of the 3 flood zone maps with a flag indicating its presence in each of those maps. Shapefile is saved with the name 
+\f1\b pluto_floodzones
+\f0\b0 .\
+\
+\
+}
