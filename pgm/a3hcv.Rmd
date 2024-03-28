@@ -1,0 +1,161 @@
+---
+title: "a3 HCV Shapefile"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(janitor)
+library(tidycensus)
+library(sf)
+
+# DIRECTORIES
+wd            <- substr(getwd(), 1, nchar(getwd())-3)
+csv           <- paste0(wd, "csv")
+dir_hcv       <- paste0(wd, "dat/Housing_Choice_Vouchers_by_Tract") 
+dir_mphcv     <- paste0(wd, "dat/mphcv") 
+
+# FILE
+fil_mp        <- "pluto_analysis_nomap.csv"
+fil_hcv       <- "HOUSING_CHOICE_VOUCHERS_BY_TRACT.shp"
+fil_mphcv     <- "mphcv.shp"
+fil_mphcv_csv <- "mphcv_analysis_nomap.csv"
+
+
+```
+
+The purpose of this file is to read in the mappluto unmapped data and join it with the HUD HCV data. That file is a shapefile with 2010 census tract barriers, so it doesn't overlap with the other ACS and Census data which relies on 2020 census tract barriers.
+
+
+# Read in both files
+
+## MapPluto unmapped data
+```{r}
+
+mp_nomap <- read_csv(file.path(csv, fil_mp),
+                     col_select = c(bbl, ct2010, fz20_100y, fz50_100y, fz50_500y, fp_cat, in_fz, res_flag, borough),
+                     col_types = cols(
+                       bbl = col_character(),
+                       ct2010 = col_character()
+                     ))
+
+glimpse(mp_nomap)
+mp_nomap %>% count(ct2010) %>% slice_sample(n=100)
+```
+
+I need to convert this census tract value into the same format in the HCV data
+```{r}
+# Create proper census tract formatted variable
+## need to identify values after the dot and before the dot
+mp_nomap2 <- mp_nomap %>%
+  filter(!is.na(ct2010)) %>%
+  rename(ct2010raw = ct2010) %>%
+  mutate(
+    # borough code
+    borocode = substr(bbl, 1, 1),
+    # before the dot
+    predot = str_pad(sub("\\..*", "", ct2010raw), width = 4, side = "left", pad = "0"),
+    # after the dot
+    postdot = ifelse(grepl("\\.", ct2010raw), sub(".*\\.", "", ct2010raw), "00"),
+    # concatenate to create the census tract 2010 code
+    ct2010 = paste0(borocode, predot, postdot),
+## also need to replace NAs with 0 for the fz_ flags
+    fz20_100y = replace_na(fz20_100y, 0),
+    fz50_100y = replace_na(fz50_100y, 0),
+    fz50_500y = replace_na(fz50_500y, 0),
+    in_fz = replace_na(in_fz, 0)
+  ) 
+
+# did any variables have missing 2010 census tract data?
+mp_nomap2 %>%
+  filter(is.na(ct2010raw))
+
+```
+
+Now, group it to the census tract level. For the fz_ flags, we are flagging a tract as being in a flood zone if at least one residential building is flagged in the flood zone.
+```{r}
+mp_nomap3 <- mp_nomap2 %>%
+  group_by(ct2010) %>%
+  summarise(fz20_100y = max(fz20_100y * res_flag, na.rm = TRUE),
+            fz50_100y = max(fz50_100y * res_flag, na.rm = TRUE),
+            fz50_500y = max(fz50_500y * res_flag, na.rm = TRUE),
+            in_fz     = max(in_fz * res_flag, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(fz_cat = case_when(
+    fz20_100y == 1 ~ "2020_100y",
+    fz50_100y == 1 ~ "2050_100y",
+    fz50_500y == 1 ~ "2050_500y"
+  )) 
+  
+mp_nomap3 %>%
+  count(fz20_100y, fz50_100y, fz50_500y, in_fz, fz_cat)
+  
+
+```
+
+## HUD HCV file
+
+HUD data comes from this website: https://hudgis-hud.opendata.arcgis.com/maps/8d45c34f7f64433586ef6a448d00ca12
+
+Before reading it in, I filtered it to the state code "36" and the county codes "005", "047", "061", "081", & "085".
+
+```{r}
+
+# HUD produced file
+hcv <- st_read(dsn = file.path(dir_hcv, fil_hcv)) %>%
+  clean_names() %>%
+  mutate(borough = case_when(
+    county == "005" ~ "2",
+    county == "047" ~ "3",
+    county == "061" ~ "1",
+    county == "081" ~ "4",
+    county == "085" ~ "5"),
+         ct2010 = paste0(borough, tract),
+         in_hcv = 1
+  )
+
+glimpse(hcv)
+
+```
+
+## Join files together
+
+```{r}
+
+mp_hcv <- full_join(
+  mutate(mp_nomap3, in_mp = 1),
+  mutate(hcv, in_hcv = 1),
+  by = "ct2010"
+)
+
+mp_hcv %>%
+  st_drop_geometry() %>%
+  count(in_mp, in_hcv)
+
+mp_hcv %>%
+  st_drop_geometry() %>%
+  filter(is.na(in_mp) | is.na(in_hcv)) %>%
+  select(ct2010, in_mp, in_hcv, everything())
+
+# most of these census tracts seem strange and maybe don't exist any more so we will just drop them and accept this as is
+
+```
+
+# Save permanent shapefile
+```{r}
+
+mp_hcv_final <- mp_hcv %>%
+  select(-in_mp, -in_hcv, -borough) 
+
+mp_hcv_final_nomap <- mp_hcv_final %>% st_drop_geometry()
+
+## Commenting out to avoid rewriting repeatedly
+# st_write(mp_hcv_final, dsn = file.path(dir_mphcv, fil_mphcv), delete_dsn = TRUE)
+# 
+# write_csv(mp_hcv_final_nomap, file.path(csv, fil_mphcv_csv))
+
+```
+

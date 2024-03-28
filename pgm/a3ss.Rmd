@@ -1,0 +1,606 @@
+---
+title: "Spatial data"
+author: "Henry Kanengiser"
+date: "2022-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+Reading in the new spatial data I prepped in QGIS and linking it to other data sources.
+
+Steps
+- clean this (drop a lot of variables)
+- maybe create a non-spatial version I can link to raw PLUTO for comparisons?
+- ultimately I'll want a linked spatial version that I can use for plotting
+
+Keep the variables that are interesting from the PLUTO file
+- see my Assignment 3 notes for info on this
+
+Join it with
+- the Census data
+- the two nycdb files
+
+
+```{r}
+library(sf)
+library(tidyverse)
+library(janitor)
+
+## DIRECTORIES:
+wd             <- substr(getwd(), 1, nchar(getwd())-3)
+rawdat         <- paste0(wd, "rawdat")
+csv            <- paste0(wd, "csv")
+dir_pfz        <- paste0(wd, "dat/pluto_floodzones")
+dir_census     <- paste0(wd, "dat/censustract")
+dir_pan        <- paste0(wd, "dat/pluto_analysis")
+dir_tran       <- paste0(wd, "dat/mpfz_tract") 
+
+## FILE NAMES:
+fil_pfz              <- "pluto_floodzones_221115.shp"
+fil_mp               <- "MapPLUTO22v2.gdb"
+fil_nycha_bbls       <- "nycha_bbls.csv"
+fil_rentstab         <- "rentstabunits.csv"
+fil_census           <- "censusacstract.shp"
+fil_pluto_an         <- "pluto_analysis.shp"
+fil_pluto_an_nomap   <- "pluto_analysis_nomap.csv"
+fil_tract_an         <- "tract_analysis.shp"
+fil_tract_an_nomap   <- "tract_analysis_nomap.csv"
+fil_hcv              <- "Housing_Choice_Vouchers_by_Tract.csv"
+
+###### HK TO DO
+# - clean up remaining file names
+# - update directory and file name text to be more obvious
+# - update folder names to match this
+
+
+```
+
+# Read in spatial files
+
+## MapPLUTO & MapPLUTO filtered to flood zone maps
+
+```{r}
+# Note: these files are large and take some time to read in
+# To streamline programming, remove spatial data from the floodzone map when reading it in
+pluto_floodzones <- read_sf(file.path(dir_pfz, fil_pfz)) %>% clean_names() %>% st_drop_geometry()
+
+# Remove the PLUTO vars that we don't use in this analysis
+mappluto <- read_sf(file.path(rawdat, fil_mp)) %>% clean_names() %>%
+  select(borough, block, lot, cd, address,
+         bct2020, bctcb2020, ct2010, bldg_class, 
+         bbl, units_res, year_built)
+
+```
+
+### Compare files and create a merged spatial file
+
+```{r}
+# Confirm that BBL is distinct on each file 
+# (s/b as many distinct values are there are rows)
+
+nrow(pluto_floodzones)
+n_distinct(pluto_floodzones$bbl)
+
+nrow(mappluto)
+n_distinct(mappluto$bbl)
+
+```
+
+To join them, drop most of the variables on pluto_floodzones to keep the different floodzone flags. We'll get all the other variables from the MapPLUTO file. We will also drop the spatial geometry from the floodzone tax lots since that data will also be on the mappluto file. This will make the file much smaller.
+
+Note: we need to rename the flood zone variables to use "fz" instead of "fp" at the start of the variable name, since flood zone is more intuitive. Do that now
+
+```{r}
+pluto_floodzones2 <- pluto_floodzones %>%
+  select(bbl, starts_with("fp")) %>%
+  rename(fz20_100y = fp20_100y,
+         fz50_100y = fp50_100y,
+         fz50_500y = fp50_500y) %>%
+  mutate(in_fz = 1)   # create dummy flag to check the merge
+
+mappluto_fz <- mappluto %>%
+  mutate(in_mp = 1) %>%
+  left_join(pluto_floodzones2, by = "bbl")
+
+# check merge using dummy vars
+# should all be in_mp
+mappluto_fz %>% st_drop_geometry() %>% count(in_mp, in_fz)
+
+
+```
+
+## Analysis of PLUTO data
+
+Working with the entire mappluto file is very slow. We will save this file to use in QGIS for mapmaking, but for now let's work on a non-spatial version (basically PLUTO but with additional flags for presence in the current and future flood zones). We will also create a map only version of the file which we can join back to it later on
+
+```{r}
+mappluto_fz_unmapped <- mappluto_fz %>% st_drop_geometry()
+mappluto_maponly <- mappluto_fz %>% select(bbl)
+
+# Counts and percents of presence in each floodplain
+mappluto_fz_unmapped %>% 
+  count(fz20_100y) %>%
+  mutate(pct = n/sum(n))
+
+mappluto_fz_unmapped %>% 
+  count(fz50_100y) %>%
+  mutate(pct = n/sum(n))
+
+mappluto_fz_unmapped %>% 
+  count(fz50_500y) %>%
+  mutate(pct = n/sum(n))
+
+```
+
+
+
+## Building type
+Here we want to isolate residential buildings and create a flag for single-family homes, condos, co-ops, and rental buildings. The following variables may be helpful in doing this: 
+-   bldg_class
+-   units_res
+
+I will use some code that Lucy gave me to identify co-ops and condo buildings and adapt it slightly for my purposes. 
+
+NOTE: After reviewing the records, it seems like buildings in the S class (RESIDENCE - MULTIPLE USE) are mostly mixed use buildings with commercial on the ground floor and apartments on higher floors. Thus, they should be included in the analysis
+
+```{r}
+mappluto_fz_unmapped %>% count(bldg_class)
+mappluto_fz_unmapped %>% count(units_res)
+
+# create lists of some of the bldg_class values we'll use in the case_when statement
+
+# Note: A8 operates more like a condo than a single-family home, even if the buildings are separate.
+# exclude it from the list of building classes here
+A <- mappluto_fz_unmapped %>% 
+  count(bldg_class) %>%
+  filter(grepl("^A[012345679]", bldg_class, ignore.case = TRUE)) %>%
+  pull(bldg_class)
+
+B <- mappluto_fz_unmapped %>% 
+  count(bldg_class) %>%
+  filter(grepl("^B", bldg_class, ignore.case = TRUE)) %>%
+  pull(bldg_class)
+
+C <- mappluto_fz_unmapped %>% 
+  count(bldg_class) %>%
+  filter(grepl("^C", bldg_class, ignore.case = TRUE)) %>%
+  pull(bldg_class)
+
+D <- mappluto_fz_unmapped %>% 
+  count(bldg_class) %>%
+  filter(grepl("^D", bldg_class, ignore.case = TRUE)) %>%
+  pull(bldg_class)
+
+S <- mappluto_fz_unmapped %>% 
+  count(bldg_class) %>%
+  filter(grepl("^S", bldg_class, ignore.case = TRUE)) %>%
+  pull(bldg_class)
+
+mappluto_fz_unmapped2 <- mappluto_fz_unmapped %>%
+  mutate(bldgtype = case_when(
+    bldg_class %in% c(A) ~ "single family",
+    bldg_class %in% c('A8') & units_res > 1 ~ "coop",
+    bldg_class %in% c('C6','C8','D0','D4') ~ "coop",
+    bldg_class %in% c('R1','R2','R3','R4','R6','R9','RD','RR') ~ "condo",
+    bldg_class %in% c(B, C, D) ~ "multiple unit",
+    bldg_class %in% c(S) & units_res > 1 ~ "multiple unit"),
+         res_flag = ifelse(!is.na(bldgtype), 1, 0))
+```
+
+Do some checks
+```{r}
+# Check range of units for each residential building type
+mappluto_fz_unmapped2 %>%
+  group_by(bldgtype) %>%
+  summarise(n_bldgs = n(),                               # num tax lots
+            n_na_unit = sum(is.na(units_res)),           # num rows missing units_res
+            min_units = min(units_res, na.rm = TRUE),    # min units_res
+            max_units = max(units_res, na.rm = TRUE),    # max units_res
+            med_units = median(units_res, na.rm = TRUE)) # median units_res
+
+## Looking at unmatched buildings with res units
+# how many buildings flagged to have at least 1 residential unit aren't being captured by this?
+mappluto_fz_unmapped2 %>%
+  mutate(anyres = ifelse(!is.na(units_res) & units_res > 0, 1, 0)) %>%
+  group_by(bldgtype) %>%
+  summarise(n = n(),
+            nres = sum(anyres))
+
+# close look at bldg_class for these tax lots
+mappluto_fz_unmapped2 %>%
+  mutate(anyres = ifelse(!is.na(units_res) & units_res > 0, 1, 0)) %>%
+  filter(is.na(bldgtype)) %>%
+  group_by(bldg_class) %>%
+  summarise(n = n(),
+            nres = sum(anyres),
+            nunits = sum(units_res))
+
+# mostly hotels, hospitals, and other building types that aren't relevant to this analysis.
+
+
+## Single family building but >1 res unit
+# Look into single family cases with more than 1 unit (are they coops or condos?)
+mappluto_fz_unmapped2 %>%
+  filter(bldgtype == "single family" & units_res > 1) %>%
+  select(bbl, borough, address, units_res, bldg_class)
+
+# This seems negligible for the purposes of this analysis.
+
+## Condo building with <2 res units
+# Look at condo building with 0 or 1 units
+mappluto_fz_unmapped2 %>%
+  filter(bldgtype == "condo" & units_res < 2) 
+
+## Condo building missing number units
+mappluto_fz_unmapped2 %>%
+  filter(bldgtype == "condo" & is.na(units_res))
+
+# All these buildings seem to be condo buildings that span several street 
+# addresses which is causing issues with their unit counts. They are 
+# definitely condo buildings and are definitely in the flood zone, so 
+# keep them and accept the loss in of units counted as condos.
+
+# Check creation of res_flag
+mappluto_fz_unmapped2 %>% count(res_flag, bldgtype)
+
+```
+
+
+
+
+## Age of buildings
+The FC analysis of building age in flood zones across the US includes a few building age cut points that can be used here as well:
+-   before 1960
+-   after 1980
+-   after 2000 (I think?)
+
+This is relevant because the first requirements for building in a flood zone were instituted in the 1960s, and the most stringent and contemporary codes came about around 2000 (?). It's costly to retrofit old buildings to current zoning codes, and those structures are less prepared for storm flooding.
+
+```{r}
+mappluto_fz_unmapped2 %>%
+  count(year_built)
+
+# set year to NA if the value is before the 1600s (assume typo)
+mappluto_fz_unmapped3 <- mappluto_fz_unmapped2 %>%
+  mutate(year_cat = case_when(
+    year_built == 0 ~ NA_character_,
+    year_built > 1650  & year_built < 1960 ~ "before 1960",
+    year_built >= 1960 & year_built < 1980 ~ "1960 - 1979",
+    year_built >= 1980 & year_built < 2000 ~ "1980 - 1999",
+    year_built >= 2000 ~ "since 2000",
+    TRUE ~ NA_character_
+  ))
+
+# Rates in the flood zone
+mappluto_fz_unmapped3 %>% 
+  filter(!is.na(bldgtype) & in_fz == 1) %>%
+  count(year_cat_RES_ONLY = year_cat) %>%
+  mutate(pct = round(n/sum(n)*100, digits = 1))
+
+# Rates overall
+mappluto_fz_unmapped3 %>% 
+  filter(!is.na(bldgtype)) %>%
+  count(year_cat_RES_ONLY = year_cat) %>%
+  mutate(pct = round(n/sum(n)*100, digits = 1))
+
+```
+
+# Join nycdb data to the mappluto data
+Now that we've created some variables for each bbl, we are ready to join the MapPLUTO data to some of the other .csv files downloaded in the raw step program from the nycdb database. Those variables will identify NYCHA developments and counts of rent stabilized units in residential buildings.
+
+## Read in nycdb datasets
+
+Note that we want to make these datasets very lean because we're only adding the most important information.
+Also note that I have identified a few bbls that need to be hardcoded to correctly link up with the MapPLUTO data.
+
+```{r}
+
+nycha <- read_csv(file.path(csv, fil_nycha_bbls)) %>%
+  # filter to only the necessary vars
+  select(bbl, address, development) %>%
+  mutate(nycha = 1) %>%
+  # do some hardcoding for particular developments that have an error
+  mutate(bbl = case_when(
+    bbl == 2022150116 ~ 1022150116,   # Marble Hill is in BX but has MN BBLs
+    bbl == 2022150623 ~ 1022150623,   # Marble Hill is in BX but has MN BBLs
+    TRUE ~ bbl
+  ))
+
+rentstab <- read_csv(file.path(csv, fil_rentstab)) %>%
+  # filter out the BBLs without any stabilized units (not relevant for this analysis)
+  filter(!is.na(uc2020)) %>%
+  # filter to only the necessary vars
+  select(bbl = ucbbl, rs2020 = uc2020, unitsres, 
+         address, zipcode, borough) %>%
+  mutate(in_rs = 1)
+
+```
+
+## Join to mappluto
+
+### NYCHA
+```{r}
+
+mpfz_nycha_unmapped_ck <- mappluto_fz_unmapped3 %>%
+  full_join(nycha, by = "bbl")
+
+mpfz_nycha_unmapped_ck %>% count(in_mp, nycha)
+
+mpfz_nycha_unmapped_ck %>%
+  filter(is.na(in_mp)) %>%
+  select(bbl, address.x, address.y, development)
+
+# I spot checked each of these using ZoLa. In each case that address was 
+# associated with another BBL which was successfully merged and flagged 
+# as nycha 
+
+mpfz_nycha_unmapped <- mpfz_nycha_unmapped_ck %>%
+  filter(!is.na(in_mp)) %>%
+  select(-address.y, address = address.x)
+
+```
+
+### Rent stabilization
+```{r}
+
+mpfz_nycdb_unmapped_ck <- mpfz_nycha_unmapped %>%
+  full_join(rentstab, by = "bbl")
+
+mpfz_nycdb_unmapped_ck %>% 
+  group_by(in_mp, in_rs) %>%
+  summarise(n = n(),
+            nunits = sum(rs2020, na.rm = TRUE))
+
+# This is a very small percentage, and the hardcoding will take a very long time to fix so I'm not going to for this analysis.
+
+mpfz_nycdb_unmapped <- mpfz_nycdb_unmapped_ck %>%
+  filter(!is.na(in_mp)) %>%
+  select(-address.y, -zipcode, -borough.y) %>%
+  rename(address = address.x, borough = borough.x)
+
+```
+
+# Save permanent PLUTO file with all these new variables
+Now that we have all the variables we want on the MapPLUTO file, save a permanent version with the spatial data we removed earlier. Also, save a permanent version without the spatial data to use in future analyses (descriptive statistics and graphs).
+
+```{r}
+
+mpfzfinal <- mappluto_maponly %>%
+  left_join(mpfz_nycdb_unmapped, by = "bbl") %>%
+  select(-starts_with("in_"), -bctcb2020, -bldg_class) %>%
+  rename(nychadev = development)
+
+#check variable name length (all has to be < 10 to avoid issues)
+
+data.frame(vars = names(mpfzfinal)) %>%
+  mutate(nchar = nchar(vars)) %>%
+  arrange(desc(nchar))
+
+```
+
+```{r save mappluto file}
+
+# Printing this within a suppressWarnings() function because of a bug in the way that the shapefile gets written (it doesn't cause any problems for the data, it just throws a warning that messes up R in a file this large)
+
+# # HK Commented out to avoid re-writing this file
+# suppressWarnings(
+# st_write(mpfzfinal,
+#          dsn = file.path(dir_pan, fil_pluto_an),
+#          layer = "mpfzmerged",
+#          delete_dsn = TRUE,
+#          quiet = TRUE)
+# )
+
+```
+
+```{r save pluto file}
+
+# # HK Commented out to avoid re-writing this file
+# write_csv(mpfz_nycdb_unmapped, file = file.path(csv, fil_pluto_an_nomap))
+
+```
+
+
+# Join ACS data to the mappluto data
+
+We will also want to explore some demographic information for the census tracts and block group. But for deciding how to describe the census tracts & block groups, we will want to know what % of that tract/group is within the flood zone.
+
+Join the ACS data to mappluto using the `bct2020` variable in PLUTO. This variable includes the borough code followed by the six-digit census tract number (which is unique at the borough level).
+
+This will produce a spatial file with census tract geometry rather than individual buildings, which can be used for different analyses and maps
+
+## Read in census/ACS data
+```{r}
+
+censustract <- read_sf(dsn = file.path(dir_census, fil_census)) %>%
+               select(-borough) %>%
+               mutate(in_census = 1)
+
+```
+
+Join this censustract data to the mappluto flood zone dataset
+```{r}
+mpfz_tracts_ck <- mpfz_nycdb_unmapped %>%
+  full_join(censustract, by = "bct2020")
+
+mpfz_tracts_ck %>% 
+  st_drop_geometry() %>%
+  count(in_mp, in_fz, in_census)
+
+# Explore the unmatched cases that are in the floodzone
+mpfz_tracts_ck %>%
+  st_drop_geometry() %>%
+  filter(in_fz == 1 & is.na(in_census)) 
+
+# none of them have census tract data and seem to be missing a lot of other descriptive information as well. Accept this level of missingness and move on
+
+mpfz_tracts_bbl <- mpfz_tracts_ck %>%
+  filter(!is.na(in_mp))
+
+```
+
+## Summarize to the census tract level 
+
+The next step is to group this file to the census tract level (instead of at the BBL level) and summarize key variables up to that level. In doing this, it's important to identify which tracts should be considered within a particular flood zone. For this analysis, a census tract that contains any residential building flagged in a flood zone will be flagged in the same flood zone. This way we can apply information on who lives in particular census tracts to the appropriate flood risk.
+
+Vars to summarize
+-   number residential units (units_res)
+-   number rent stabilized units (rs2020)
+-   number nycha units (units_res * nycha)
+-   max value for each of the fz_ variables (for res_flag only)
+-   count of residential types (from bldgtype)
+-   count of residential units by type (bldgtype * units_res)
+-   count of residential types by year_cat (bldgtype * year_cat)
+-   count of residential units by type & age (bldgtype * units_res * year_cat) - SFH & MFH only for now
+
+Note that in grouping these data we lose spatial geometry. Add it back in a later step to save a complete .shp file.
+
+```{r}
+
+# Prepare the data by doing a little data manipulation
+mpfz_tracts_bblprep <- mpfz_tracts_bbl %>%
+  mutate(fz20_100y = replace_na(fz20_100y, 0), 
+         fz50_100y = replace_na(fz50_100y, 0),
+         fz50_500y = replace_na(fz50_500y, 0),
+         iscondo = ifelse(bldgtype == "condo", 1, 0),
+         iscoop = ifelse(bldgtype == "coop", 1, 0),
+         issfh = ifelse(bldgtype == "single family", 1, 0),
+         ismfh = ifelse(bldgtype == "multiple unit", 1, 0),
+         yb_bf1960 = ifelse(res_flag == 1 & year_cat == "before 1960", 1, 0),
+         yb_60t79 = ifelse(res_flag == 1 & year_cat == "1960 - 1979", 1, 0),
+         yb_80t99 = ifelse(res_flag == 1 & year_cat == "1980 - 1999", 1, 0),
+         yb_2000af = ifelse(res_flag == 1 & year_cat == "since 2000", 1, 0)) 
+
+# Quick checks on variable creation
+mpfz_tracts_bblprep %>% count(fz20_100y, fz50_100y, fz50_500y)
+mpfz_tracts_bblprep %>% count(bldgtype, iscondo, iscoop, issfh, ismfh)
+mpfz_tracts_bblprep %>% count(res_flag, year_cat, yb_bf1960, yb_60t79, yb_80t99, yb_2000af)
+
+```
+
+
+```{r}
+
+mpfz_tract <- mpfz_tracts_bblprep %>%
+  group_by(bct2020) %>%
+  summarise(
+    # Counts of units within census tract 
+    nun_res   = sum(units_res, na.rm = TRUE),
+    nun_rs    = sum(rs2020, na.rm = TRUE),
+    nun_nycha = sum(units_res * nycha, na.rm = TRUE),
+    # Flood zone flag (if at least one building is residential)
+    fzr20_100y = max(ifelse(res_flag == 1 & fz20_100y == 1, 1, 0)),
+    fzr50_100y = max(ifelse(res_flag == 1 & fz50_100y == 1, 1, 0)),
+    fzr50_500y = max(ifelse(res_flag == 1 & fz50_500y == 1, 1, 0)),
+    # Count of residential building types
+    ncondo = sum(iscondo, na.rm = TRUE),
+    ncoop  = sum(iscoop, na.rm = TRUE),
+    nsfh   = sum(issfh, na.rm = TRUE),
+    nmfh   = sum(ismfh, na.rm = TRUE),
+    # Count of units by building type
+    nuncondo = sum(units_res * iscondo, na.rm = TRUE),
+    nuncoop  = sum(units_res * iscoop, na.rm = TRUE),
+    nunsfh   = sum(units_res * issfh, na.rm = TRUE),
+    nunmfh   = sum(units_res * ismfh, na.rm = TRUE),
+    # Count of residential buildings by year built
+    nres_bf1960 = sum(res_flag * yb_bf1960, na.rm = TRUE),
+    nres_60t79  = sum(res_flag * yb_60t79, na.rm = TRUE),
+    nres_80t99  = sum(res_flag * yb_80t99, na.rm = TRUE),
+    nres_2000af = sum(res_flag * yb_2000af, na.rm = TRUE),
+    # Count of units by year built
+    nun_bf1960 = sum(res_flag * units_res * yb_bf1960, na.rm = TRUE),
+    nun_60t79  = sum(res_flag * units_res * yb_60t79, na.rm = TRUE),
+    nun_80t99  = sum(res_flag * units_res * yb_80t99, na.rm = TRUE),
+    nun_2000af = sum(res_flag * units_res * yb_2000af, na.rm = TRUE),
+    # Count of units by year built and bldg type
+    ### single family houses
+    nunbf60sfh  = sum(issfh * units_res * yb_bf1960, na.rm = TRUE),
+    nun60t79sfh = sum(issfh * units_res * yb_60t79, na.rm = TRUE),
+    nun80t99sfh = sum(issfh * units_res * yb_80t99, na.rm = TRUE),
+    nun00afsfh  = sum(issfh * units_res * yb_2000af, na.rm = TRUE),
+    ### multiple family houses
+    nunbf60mfh  = sum(ismfh * units_res * yb_bf1960, na.rm = TRUE),
+    nun60t79mfh = sum(ismfh * units_res * yb_60t79, na.rm = TRUE),
+    nun80t99mfh = sum(ismfh * units_res * yb_80t99, na.rm = TRUE),
+    nun00afmfh  = sum(ismfh * units_res * yb_2000af, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    fp_cat = ifelse(fzr20_100y == 1, "2020_100y",
+                    ifelse(fzr50_100y == 1, "2050_100y",
+                           ifelse(fzr50_500y == 1, "2050_500y", NA_character_)))
+  )
+
+
+# Check creation of summarized variables
+
+## number of units vars
+mpfz_tracts_bblprep %>%
+  summarise(nun_res = sum(units_res, na.rm = TRUE),
+            nun_rs  = sum(rs2020, na.rm = TRUE),
+            nun_nycha = sum(units_res * nycha, na.rm = TRUE))
+mpfz_tract %>%
+  summarise(nun_res = sum(nun_res),
+            nun_rs = sum(nun_rs),
+            nun_nycha = sum(nun_nycha))
+mpfz_tracts_bblprep %>%
+  mutate(nun_nycha = units_res * nycha) %>%
+  select(bbl, units_res, nycha, nun_nycha) %>%
+  filter(nycha == 1) %>%
+  slice_sample(n=10)
+
+mpfz_tract %>% count(fzr20_100y, fzr50_100y, fzr50_500y, fp_cat)
+
+```
+
+Now, join with the original census tract file to get all the tract-level data and geometry onto one file
+
+```{r}
+glimpse(mpfz_tract)
+
+glimpse(censustract)
+
+mpfz_tract_join <- full_join(
+  censustract, 
+  mutate(mpfz_tract, in_mp = 1), 
+  by = "bct2020")  
+
+# check merge
+mpfz_tract_join %>% 
+  st_drop_geometry() %>% 
+  count(in_census, in_mp)
+
+mpfz_tract_join %>% 
+  st_drop_geometry() %>% 
+  filter(is.na(in_census) | is.na(in_mp))
+
+# Most of these are water or parks, the only exception being part of Co-Op City
+# bct2020 = 2046206
+# This seems to be a strange gap in the data that I will accept for this project
+
+# Look at the census tracts for Co-Op city, notice that 462.06 is missing
+mpfz_tract %>%
+  filter(grepl("20462", bct2020))
+
+```
+
+
+
+### Save a permanent census tract-level file
+
+```{r}
+
+# # HK Commented out to avoid rewriting data
+# # with spatial information
+st_write(mpfz_tract_join, dsn = file.path(dir_tran, fil_tract_an), delete_dsn = TRUE)
+
+# # without spatial information
+write_csv(mpfz_tract_join, file.path(csv, fil_tract_an_nomap))
+
+```
+

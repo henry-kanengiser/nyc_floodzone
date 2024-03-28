@@ -1,0 +1,452 @@
+---
+title: "a3Read In Files"
+author: "Henry Kanengiser"
+date: "2022-11-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(janitor)
+library(tidycensus)
+library(sf)
+
+
+
+# DIRECTORIES 
+# (necessary because there are many files in this folder and I needed to use subfolders)
+wd <- substr(getwd(), 1, nchar(getwd())-3)
+dir <- paste0(wd, "csv")
+dir2 <- paste0(wd, "dat/censustract")
+
+
+# FILE NAMES
+censusfil <- "censusacstract.shp"
+nychafil <- "nycha_bbls.csv"
+rentstab <- "rentstabunits.csv"
+
+
+```
+
+The **purpose** of this .Rmd file is to read in and do initial checking on the main tabular data used in this project. This includes data from NYC DCP, the Census, and from [nycdb](https://github.com/nycdb/nycdb), a collection of ready-to-use NYC housing data. At the end of this program, permanent cleaned files are saved, which will be joined and restructured in a later program.
+
+This is the first of several programs used for this project. The second will be the summary step program (a3ss), where I consolidate and restructure these dataset. The thirs program will be the analysis program (a3an), where I conduct analyses and produce figures based on those analyses.
+
+# Census data
+
+I use Census data to describe demographic characteristics of the census tracts and block groups in the flood zone
+
+```{r}
+
+# Pull the variables from the ACS and the decennial census to identify what will be helpful for this analysis
+
+# # HK commented out because we don't need to print these for the code to run
+# cen20vars <- load_variables(2020, "pl", cache = TRUE)
+acs20vars <- load_variables(2020, "acs5", cache = TRUE)
+
+```
+
+The census values will provide race/ethnicity information. The variables we want include: P2_001N through P2_011N
+P2_001N (total population)
+P2_002N (Hispanic or Latino)
+P2_003N (not Hispanic or Latino)
+P2_004N (not Hispanic or Latino: 1 race)
+P2_005N (...: white alone)
+P2_006N (...: Black or African American alone)
+P2_007N (...: American Indian or Alaska Native alone)
+P2_008N (...: Asian alone)
+P2_009N (...: Hawaiian or Pacific Islander alone)
+P2_010N (...: other race alone)
+P2_011N (...: 2+ races)
+
+The ACS variables are more complicated to hunt down. Median hh income comes from the following variables:
+**Block group**
+B19013_001 (median hh income in past 12 months)
+table B19001 breaks down hh income by $5,000 categories (block group ONLY)
+**Census tract**
+B25119_001 (Median household income in the past 12 months)
+B25119_002 (Med HH inc - Owner occupied)
+B25119_003 (Med HH inc - Renter occupied)
+B09019_003 (Total households)
+B07013_002 (householder living in owner-occupied unit - tract)
+B07013_003 (householder living in renter-occupied unit - tract)
+More info about this term [here](https://www.census.gov/quickfacts/fact/note/US/HSG445220)
+
+Estimated population living in owner/renter-occupied units:
+**Block group**
+B25008_001 (total)
+B25008_002 (owner occupied)
+B25008_003 (renter occupied)
+**Census tracts**
+B25026_001 (total)
+B25026_002 (owner occupied)
+B25026_009 (renter occupied)
+
+Now, read in these datasets from tidycensus
+
+## Decennial census
+```{r}
+
+# Filter the file down to just NYC
+#--census tract
+census_pop_tract <- get_decennial(
+  geography = "tract",
+  variables = c(
+    poptot    = "P2_001N",
+    pophis    = "P2_002N",
+    popnhis   = "P2_003N",
+    popnh1r   = "P2_004N",
+    popwhite  = "P2_005N",
+    popblack  = "P2_006N",
+    popamind  = "P2_007N",
+    popasian  = "P2_008N",
+    poppacil  = "P2_009N",
+    popoth1r  = "P2_010N",
+    popnhis2r = "P2_011N"
+  ),
+  state = "New York",
+  geometry = TRUE,
+  year = 2020
+) %>%
+  clean_names() %>%
+  filter(grepl("Bronx|Kings|New York County|Queens|Richmond", name)) %>%
+  pivot_wider(id_cols = c("geoid", "name", "geometry"),
+              names_from = "variable",
+              values_from = "value")
+
+# Check variable creation against the data.census.gov website
+# https://data.census.gov/table?q=Race+and+Ethnicity&g=0500000US36005,36047,36061,36081,36085
+
+census_pop_tract %>%
+  st_drop_geometry() %>%
+  mutate(borough = case_when(
+    grepl("New York County", name) ~ "New York",
+    grepl("Bronx", name) ~ "Bronx",
+    grepl("Kings", name) ~ "Kings",
+    grepl("Queens", name) ~ "Queens",
+    grepl("Richmond", name) ~ "Richmond",)) %>%
+  group_by(borough) %>%
+  summarise(
+    poptot = sum(poptot, na.rm = TRUE),
+    pophis = sum(pophis, na.rm = TRUE),
+    popwhite = sum(popwhite, na.rm = TRUE), 
+    popblack = sum(popblack, na.rm = TRUE),
+    popasian = sum(popasian, na.rm = TRUE)
+  )
+
+```
+
+## ACS data
+
+### Block group
+```{r}
+
+acs_block <- get_acs(
+  geography = "block group",
+  variables = c(
+    med_hh_inc_bg = "B19013_001",
+    pop_total_bg = "B25008_001",
+    pop_owner_bg = "B25008_002",
+    pop_renter_bg = "B25008_003"
+  ),
+  year = 2020,
+  state = "New York",
+  geometry = TRUE,
+  survey = "acs5"
+) %>%
+  clean_names() %>%
+  filter(grepl("Bronx|Kings|New York County|Queens|Richmond", name)) %>%
+  mutate(moe_rate = moe/estimate) 
+
+#Look at moe_rates (note that there are many beyond the range of 0-1)
+acs_block %>%
+  ggplot() + 
+  aes(x = moe_rate) + 
+  geom_histogram() + 
+  scale_x_continuous(limits = c(0,1)) + 
+  facet_wrap(~variable)
+
+```
+
+
+### Census tract
+```{r}
+
+acs_tract <- get_acs(
+  geography = "tract",
+  variables = c(
+    mhhinc    = "B25119_001",
+    mhhinco = "B25119_002",
+    mhhincr = "B25119_003",
+    pophoh  = "B09019_003",
+    poptotal  = "B25026_001",
+    popowner  = "B25026_002",
+    poprenter = "B25026_009"
+  ),
+  year = 2020,
+  state = "New York",
+  geometry = TRUE,
+  survey = "acs5"
+) %>%
+  clean_names() %>%
+  filter(grepl("Bronx|Kings|New York County|Queens|Richmond", name)) %>%
+  mutate(moerate = moe/estimate) 
+
+
+acs_tract %>%
+  ggplot() + 
+  aes(x = moerate) + 
+  geom_histogram() + 
+  scale_x_continuous(limits = c(0,1)) + 
+  facet_wrap(~variable)
+
+```
+
+Because the MOE's are considerably lower for census tracts than for block groups, we will use tracts going forward
+
+Restructure the ACS tract data to be ready to merge
+
+```{r}
+
+acs_tract2 <- acs_tract %>%
+  pivot_wider(id_cols = c("geoid", "name", "geometry"),
+              names_from = "variable",
+              names_glue = "{variable}{.value}",
+              values_from = c("estimate", "moe", "moerate")) %>%
+  #shorten the estimate varaible names
+  rename(mhhinc = mhhincestimate,
+         mhhinco = mhhincoestimate,
+         mhhincr = mhhincrestimate,
+         pophoh = pophohestimate,
+         poptotal = poptotalestimate,
+         popowner = popownerestimate,
+         poprenter = poprenterestimate)
+
+glimpse(acs_tract2)
+
+```
+
+## Join census and ACS data (census tract)
+
+Join the ACS and Census data into one wide dataset that can be added to the MapPLUTO data in the next program.
+Note that we need to recreate the borough-census tract combo that is used in PLUTO
+-   7 digits long (1 digit for boro code, followed by 6 digits for census tract)
+-   last two digits are for after the decimal point. if there's no decimal then pad with two zeroes
+
+```{r}
+
+census_acs_tract <- acs_tract2 %>% 
+  #remove duplicate geometry
+  st_drop_geometry() %>%
+  select(-geoid) %>%
+  #join by census tract name
+  left_join(census_pop_tract, by = "name") %>%
+  mutate(borough = case_when(
+    grepl("New York County", name) ~ "1",
+    grepl("Bronx", name) ~ "2",
+    grepl("Kings", name) ~ "3",
+    grepl("Queens", name) ~ "4",
+    grepl("Richmond", name) ~ "5",
+    TRUE ~ NA_character_
+  ),
+  #extract the census tract number
+  census_tract_raw = gsub(".*Census Tract (.*?), .*", "\\1", name),
+  #pull pre-dot part
+  census_tract_predot = sub("\\..*", "", census_tract_raw),
+  census_tract_postdot = ifelse(
+    grepl("\\.", census_tract_raw), sub(".*\\.", "", census_tract_raw), "00"
+    ),
+  bct2020 = paste0(borough, str_pad(census_tract_predot, width = 4, side = "left", pad = "0"), census_tract_postdot))
+  
+# Check creation of each of these variables to make sure it fits the MapPLUTO convention
+census_acs_tract %>%
+  select(name, borough, census_tract_raw, census_tract_predot, census_tract_postdot, bct2020) %>%
+  slice_sample(n = 100)
+
+```
+
+Prep to save it as a shapefile
+```{r}
+as.data.frame(
+names(census_acs_tract),
+substr(names(census_acs_tract), 1, 10)) %>%
+  mutate(nchar = nchar(`names(census_acs_tract)`)) %>%
+  arrange(desc(nchar))
+
+# drop some of the longer variables that we no longer need
+
+census_acs_tract2 <- census_acs_tract %>%
+  select(-census_tract_postdot, 
+         -census_tract_predot, 
+         -census_tract_raw, 
+         -contains("moerate"))
+
+glimpse(census_acs_tract2)
+
+# check if any important vars are still being cut off (no)
+as.data.frame(
+names(census_acs_tract2),
+substr(names(census_acs_tract2), 1, 10)) %>%
+  mutate(nchar = nchar(`names(census_acs_tract2)`)) %>%
+  arrange(desc(nchar))
+
+```
+
+
+
+# NYCDB datasets
+
+## NYCHA bbls
+```{r}
+url <- "https://raw.githubusercontent.com/JustFixNYC/nycha-scraper/098bd8232bee2cd59266bf278e26e32bd0cd7df1/Block-and-Lot-Guide-08272018.csv"
+
+nycha_bbls_raw <- read.csv(url) %>% clean_names()
+glimpse(nycha_bbls_raw)
+
+# missing bbl, need to create it from borough block and lot
+
+# check that block and lot are never more than 5 and 4 numbers long
+nycha_bbls_raw %>%
+  summarise(l_block = max(block),
+            l_lot = max(lot))
+
+
+nycha_bbls2 <- nycha_bbls_raw %>%
+  mutate(borocode = case_when(
+    borough == "MANHATTAN" ~ "1",
+    borough == "BRONX" ~ "2",
+    borough == "BROOKLYN" ~ "3",
+    borough == "QUEENS" ~ "4",
+    borough == "STATEN ISLAND" ~ "5",
+    TRUE ~ "error"
+  )) %>%
+  mutate(bbl = paste0(
+    borocode,
+    str_pad(block, width = 5, side = "lef", pad = "0"),
+    str_pad(lot, width = 4, side = "left", pad = "0")
+  )) 
+
+# spot check of var creation
+nycha_bbls2 %>%
+  select(borough, borocode, block, lot, bbl) %>%
+  slice_sample(n = 100)
+
+
+
+```
+
+The dataset seems too long for the number of NYCHA developments, investigate duplicates in BBL and decide what to do
+```{r}
+
+nycha_bbls2 %>%
+  group_by(bbl) %>%
+  summarise(nrows = n()) %>%
+  count(nrows)
+
+# make sure that only one development name is associated with each BBL, then deduplicate
+nycha_bbls2 %>%
+  group_by(bbl) %>%
+  mutate(namesame = ifelse(first(development) == last(development), 1, 0)) %>%
+  ungroup() %>%
+  filter(namesame == 0)
+  
+# count(namesame)
+
+# these differences are understandable (BETANCES V vs BETANCES VI are the same development)
+```
+
+
+Since we are only interested in identifying the NYCHA developments associated with each BBL, we can deduplicate this dataset to the BBL level.
+
+```{r}
+# deduplicate, keeping the row with the most common development name
+nycha_bbls3 <- nycha_bbls2 %>%
+  left_join(
+    nycha_bbls2 %>% count(bbl, development, name = "ndevelopment"),
+    by = c("bbl", "development")
+  )
+
+
+nycha_bbls4 <- nycha_bbls3 %>%
+  arrange(desc(ndevelopment)) %>%
+  group_by(bbl) %>%
+  distinct(bbl, .keep_all = TRUE) %>%
+  select(-ndevelopment)
+
+nycha_bbls4 %>% head(n=10)
+
+```
+
+
+
+## rent stabilized units per bbl
+
+Note that there are two different files that I have to stack to get comprehensive data on # rent stabilize units dating back to 2007
+```{r}
+
+#older data (2007-2017)
+url <- "https://taxbillsnyc.s3.amazonaws.com/joined.csv"
+
+rentstabold <- read.csv(url) %>% clean_names()
+
+glimpse(rentstabold)
+```
+
+```{r}
+#newer data (2018-2020)
+url <- "https://s3.amazonaws.com/justfix-data/rentstab_counts_from_doffer_2020.csv"
+
+rentstabnew <- read.csv(url) %>% clean_names()
+
+glimpse(rentstabnew)
+
+
+```
+
+Now, join the two rentstab files together into one
+
+```{r}
+rentstaball <- full_join(
+  mutate(rentstabold, in_old = 1),
+  mutate(rentstabnew, in_new = 1),
+  by = "ucbbl"
+)
+
+# check success of the merge (do most rows line up?)
+rentstaball %>% count(in_old, in_new)
+
+# yes, but there are a substantial number that don't, look into why
+
+# did the buildings on the old file have 0 stabilized units in the last year?
+rentstaball %>%
+  filter(is.na(in_new)) %>%
+  mutate(none2017 = is.na(x2017uc)) %>%
+  count(none2017)
+# mostly (10%)
+
+# i think i'll likely end up using the most recent year of data anyway, so this is fine
+
+```
+
+
+# Save permanent files
+```{r}
+
+## HK Commented out to avoid re-saving these each time I run the program. 
+## Uncomment to save
+
+# # Census Data
+st_write(census_acs_tract2, dsn = file.path(dir2, censusfil), delete_dsn = TRUE)
+
+# # NYCHA BBLs
+# write_csv(nycha_bbls4, file = file.path(dir,nychafil))
+# 
+# # Rent stabilized units
+# write_csv(rentstaball, file = file.path(dir, rentstab))
+
+```
+
+
+

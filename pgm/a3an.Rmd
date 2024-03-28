@@ -1,0 +1,1019 @@
+---
+title: "Flood Zones Analysis"
+author: "Henry Kanengiser"
+date: "2022-11-23"
+output: 
+  html_document:
+    df_print: paged
+    code_folding: hide
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(sf)
+library(rlang)
+library(janitor)
+library(kableExtra)
+
+#DIRECTORIES
+wd      <- substr(getwd(), 1, nchar(getwd())-3)
+csv     <- paste0(wd, "csv")
+out     <- paste0(wd, "out")
+
+#FILES
+fil_p   <- "pluto_analysis_nomap.csv"
+fil_t   <- "tract_analysis_nomap.csv"
+fil_h   <- "mphcv_analysis_nomap.csv"
+
+```
+
+The **purpose** of this file is to conduct analyses with the restructured and cleaned datasets as part of of my analysis into NYC's floodzones. This program builds on the code and permanent files developed in two earlier .Rmd files (a3rs and a3ss). The permanent files read into this program were created in one of those two files.
+
+# Read in files
+Note that in R I really only need to work with the non-spatial versions of the files for this analysis.
+
+```{r read in csvs}
+
+# Tax-lot level analysis file
+tractan <- read_csv(file.path(csv, fil_t))
+
+# Census tract level analysis file
+plutoan <- read_csv(file.path(csv, fil_p))
+
+```
+
+Create a few important variables
+
+pluto-level
+-   turn the fz flag vars into 0/1 vars rather than NA/1 vars
+-   estimate counts of units owned and rented based on bldg type
+
+tract-level
+-   borough
+-   turn the fz flag vars into 0/1 vars rather than NA/1 vars
+
+```{r create descriptive vars - PLUTO}
+
+glimpse(plutoan)
+
+plutoan2 <- plutoan %>%
+  mutate(fz20_100y = replace_na(fz20_100y, 0),
+         fz50_100y = replace_na(fz50_100y, 0),
+         fz50_500y = replace_na(fz50_500y, 0),
+         nycha = replace_na(nycha, 0),
+         units_own = case_when(
+          bldgtype == "single family" ~ units_res,
+          bldgtype == "multiple unit" ~ 1,
+          bldgtype == "condo" ~ units_res,
+          bldgtype == "coop" ~ units_res
+    ),
+        units_rent = case_when(
+          bldgtype %in% c("single family", "condo", "coop") ~ 0,
+          bldgtype == "multiple unit" ~ units_res - 1
+     ))
+
+#Check creation of units_own and units_rent
+# Check var creation
+plutoan2 %>%
+  filter(res_flag == 1) %>%
+  summarise(units_res = sum(units_res, na.rm = TRUE),
+            units_own = sum(units_own, na.rm = TRUE),
+            units_rent = sum(units_rent, na.rm = TRUE))
+
+plutoan2 %>% 
+  count(res_flag, bldgtype, units_res, units_own, units_rent) %>%
+  slice_sample(n=30) %>%
+  arrange(desc(res_flag), bldgtype, units_res)
+
+```
+
+```{r create descriptive vars - TRACT}
+
+glimpse(tractan)
+
+tractan2 <- tractan %>%
+  mutate(borocode = substr(bct2020, 1, 1),
+         borough = case_when(
+           borocode == "1" ~ "MN",
+           borocode == "2" ~ "BX",
+           borocode == "3" ~ "BK",
+           borocode == "4" ~ "QN",
+           borocode == "5" ~ "SI"
+         ),
+         fzr20_100y = replace_na(fzr20_100y, 0),
+         fzr50_100y = replace_na(fzr50_100y, 0),
+         fzr50_500y = replace_na(fzr50_500y, 0)
+         )
+
+# Check creation of borocode and borough
+tractan2 %>% count(borocode, borough)
+tractan2 %>% slice_sample(n=20) %>% select(bct2020, borocode, borough)
+
+```
+
+
+# Primary Question
+
+**Primary research question: What are the trends in housing types in New York City’s current and future flood zones, and who lives in that housing?**
+
+### How many rental units versus owner-occupied?
+
+MapPLUTO doesn't break down units by rental versus owner-occupied, so there are two ways to try to answer this:
+
+**Tax-lot level**
+
+-   Start with counts of residential type in the different flood zones (# and as % of entire city) 
+
+```{r}
+
+#Use map() to run the same frequency for all three flood zone vars
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+countpct <- function(var) {
+  plutoan2 %>%
+    filter(res_flag == 1) %>% 
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    summarise(count := n(),
+              pct := count / nrow(.)) %>%
+    ungroup() %>%
+    adorn_totals("row")
+}
+
+map(vars, countpct)
+
+```
+
+-   Using the residential type and number of residential units variables (for multi-family housing, assume that 1 unit is owner-occupied to be conservative)
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+unit_ctpct <- function(var){
+  plutoan2 %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    summarise(units_own = sum(units_own, na.rm = TRUE),
+              units_rent = sum(units_rent, na.rm = TRUE),
+              units_own_pct = units_own / sum(plutoan2$units_own, na.rm = TRUE),
+              units_rent_pct = units_rent / sum(plutoan2$units_rent, na.rm = TRUE)) %>%
+    ungroup() %>%
+    adorn_totals("row")
+}
+
+map(vars, unit_ctpct)
+  
+
+
+```
+
+
+**Census tract level**
+
+-   Use ACS responses at the census tract level, which gives an estimate of the area even if it's not exactly lined up with the flood zones
+
+```{r}
+
+vars <- c("fzr20_100y", "fzr50_100y", "fzr50_500y")
+
+tract_ctpct <- function(var){
+  tractan2 %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    summarise(n_own = sum(popownr, na.rm = TRUE),
+            n_rent = sum(poprntr, na.rm = TRUE),
+            n_tot = sum(poptotl, na.rm = TRUE)) %>%
+    adorn_totals("row") %>%
+    mutate(p_own = n_own / n_tot,
+           p_rent = n_rent / n_tot) 
+}
+
+map(vars, tract_ctpct)
+
+```
+
+  -   At the borough level
+  
+```{r}
+
+vars <- c("fzr20_100y", "fzr50_100y", "fzr50_500y")
+
+tract_ctpctboro <- function(var){
+  tractan2 %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(n_own = sum(popownr, na.rm = TRUE),
+            n_rent = sum(poprntr, na.rm = TRUE),
+            n_tot = sum(poptotl, na.rm = TRUE),
+            .groups = "keep") %>%
+    adorn_totals("row", fill = "NYC") %>%
+    mutate(p_own = n_own / n_tot,
+           p_rent = n_rent / n_tot) 
+}
+
+map(vars, tract_ctpctboro)
+
+```
+
+
+# GRAPH: count of citywide renter and owner population in the fz
+
+```{r}
+
+pop_fz20 <- tractan2 %>%
+  group_by(fzr20_100y) %>%
+  summarise(n_own = sum(popownr, na.rm = TRUE),
+          n_rent = sum(poprntr, na.rm = TRUE)) %>%
+  ungroup() %>%
+  adorn_totals("row") %>%
+  rename(in_fz = fzr20_100y) %>%
+  mutate(fz = ifelse(in_fz == "Total", "All of NYC", "2020 Flood Zone"))
+
+pop_fz50 <- tractan2 %>%
+  group_by(fzr50_100y) %>%
+  summarise(n_own = sum(popownr, na.rm = TRUE),
+          n_rent = sum(poprntr, na.rm = TRUE)) %>%
+  ungroup() %>%
+  rename(in_fz = fzr50_100y) %>%
+  mutate(fz = "2050 Flood Zone",
+         in_fz = as.character(in_fz))
+
+pop_graph <- bind_rows(pop_fz20, pop_fz50) %>%
+  filter(in_fz != 0) %>%
+  select(-in_fz) %>%
+  pivot_longer(cols = c(n_own, n_rent), names_to = "var", values_to = "values")
+
+```
+
+```{r}
+
+plot <- pop_graph %>%
+  ggplot() +
+  aes(fill = var, y = values, x = fz) + 
+  geom_bar(position = "stack", stat = "identity") + 
+  scale_y_continuous(limits = c(0,8300000), 
+                     labels = scales::comma, 
+                     breaks = c(0, 2000000, 4000000, 6000000, 8000000), 
+                     minor_breaks = NULL) + 
+  labs(
+    y = "Population",
+    x = NULL
+  ) +
+  theme_minimal()
+
+plot
+
+## save permanent version (5x9 dimenstions)
+ggsave(filename = file.path(out, "fig_popfz.pdf"), plot, width = 18, height = 10, units = "in")
+
+```
+
+
+
+### Digging into this
+
+Break these rates down by borough
+-   which borough has most of the residential units in the flood zone? (1 borough ÷ 5 boroughs)
+
+In the future, Brooklyn will have the majority of the buildings in the flood zone (50%, compared to 29% outside the flood zone in the 2050 500-year storm), but for now it hashas a more proportional amount that's still the plurality
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+countpct_boro <- function(var) {
+  plutoan2 %>%
+    filter(res_flag == 1) %>% 
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(count := n(),
+              .groups = "keep") %>%
+    ungroup() %>%
+    adorn_totals("row", fill = "NYC") %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    mutate(pct = count / sum(count))
+  
+  # # GROUPED BAR PLOT (uncomment if you want to show that)
+  # plutoan2 %>%
+  #   filter(res_flag == 1) %>%
+  #   group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+  #   summarise(count := n(),
+  #             .groups = "keep") %>%
+  #   ungroup() %>%
+  #   adorn_totals("row", fill = "NYC") %>%
+  #   group_by({{var}} := eval(as.name(paste(var)))) %>%
+  #   mutate(pct = count / sum(count)) %>%
+  #   ggplot() +
+  #   aes(fill = eval(as.name(paste(var))), x = borough, y = pct) +
+  #   geom_col(position = "dodge")
+}
+
+map(vars, countpct_boro)
+
+
+```
+
+
+    --    has the most owner-occupied versus renter?
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+unit_ctpct_boro <- function(var){
+  plutoan2 %>%
+    filter(res_flag == 1) %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(n_own = sum(units_own, na.rm = TRUE),
+              n_rent = sum(units_rent, na.rm = TRUE),
+              n_tot = sum(units_res * res_flag, na.rm = TRUE),
+              .groups = "keep") %>%
+    ungroup() %>%
+    adorn_totals("row", fill = "NYC") %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    mutate(p_own = n_own / sum(n_own),
+           p_rent = n_rent / sum(n_rent))
+}
+
+map(vars, unit_ctpct_boro)
+
+```
+
+-   which borough has the highest % of its residential units in the flood zone (in_fz ÷ total units in borough)
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+countpct_boro <- function(var) {
+  plutoan2 %>%
+    filter(res_flag == 1) %>% 
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(count := n(),
+              .groups = "keep") %>%
+    ungroup() %>%
+    adorn_totals("row", fill = "NYC") %>%
+    group_by(borough) %>%
+    mutate(pct = count / sum(count)) 
+  
+  # # GROUPED BAR PLOT (uncomment if you want to show that)
+  plutoan2 %>%
+    filter(res_flag == 1) %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(count := n(),
+              .groups = "keep") %>%
+    ungroup() %>%
+    adorn_totals("row", fill = "NYC") %>%
+    group_by(borough) %>%
+    mutate(pct = count / sum(count)) %>%
+    ggplot() +
+    aes(fill = eval(as.name(paste(var))), x = borough, y = pct) +
+    geom_col(position = "dodge")
+}
+
+map(vars, countpct_boro)
+
+
+
+```
+
+    --    has the most owner-occupied versus renter
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+unit_ctpct_boro <- function(var){
+  plutoan2 %>%
+    filter(res_flag == 1) %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(n_own = sum(units_own, na.rm = TRUE),
+              n_rent = sum(units_rent, na.rm = TRUE),
+              n_tot = sum(units_res * res_flag, na.rm = TRUE),
+              .groups = "keep") %>%
+    ungroup() %>%
+    adorn_totals("row", fill = "NYC") %>%
+    group_by(borough) %>%
+    mutate(p_own = n_own / sum(n_own),
+           p_rent = n_rent / sum(n_rent))
+}
+
+map(vars, unit_ctpct_boro)
+
+```
+
+Calculate the average number of units per building in the flood zone
+
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+vunit <- function(var){
+  avg_unit <- plutoan2 %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(n_unit = sum(units_res * res_flag, na.rm = TRUE),
+              n_bldg = sum(res_flag, na.rm = TRUE),
+              avg_unit = n_unit / n_bldg,
+              .groups = "keep") %>%
+    arrange(borough) 
+  
+  print(avg_unit)
+  
+  avg_unit %>%
+    mutate(`Flood Zone` = ifelse(eval(as.name(paste(var))) == 1, paste0("In ", {{var}}), "Not in flood zone")) %>%
+    ggplot() + 
+    aes(fill = `Flood Zone`, x = borough, y = avg_unit) + 
+    geom_col(position = "dodge")
+  
+}
+
+map(vars, vunit)
+
+```
+
+# GRAPH: Average number of units in the fz by borough
+
+```{r}
+
+var <- c("fz20_100y", "fz50_100y")
+
+vunit_map <- function(var){
+  avg_unit <- plutoan2 %>%
+    group_by(fz := eval(as.name(paste(var))), borough) %>%
+    summarise(n_unit = sum(units_res * res_flag, na.rm = TRUE),
+              n_bldg = sum(res_flag, na.rm = TRUE),
+              .groups = "keep") %>%
+    adorn_totals("row", fill = "NYC") %>%
+    mutate(avg_unit = n_unit / n_bldg,
+           fz = case_when(
+             fz == "0" ~ "drop",
+             fz == "1" ~ {{var}},
+             fz == "Total" ~ {{var}}
+           ))
+  
+  print(avg_unit)
+}
+
+vunit_graph <- map_dfr(var, vunit_map) %>%
+  filter(fz != "drop")
+
+plot <- vunit_graph %>%
+  mutate(borough_f = factor(borough, level = c("MN", "BX", "BK", "QN", "SI", "NYC"))) %>%
+  ggplot() + 
+  aes(fill = fz, x = borough_f, y = avg_unit) + 
+  geom_bar(position = "dodge", stat = "identity") + 
+  theme_minimal()
+
+plot
+
+# ggsave(filename = file.path(out, "fig_vunit.pdf"), plot, width = 18, height = 10, units = "in")
+
+```
+
+```{r}
+avg_unit20_100y <- plutoan2 %>%
+  group_by(fz20_100y, borough) %>%
+  summarise(n_unit = sum(units_res * res_flag, na.rm = TRUE),
+            n_bldg = sum(res_flag, na.rm = TRUE),
+            avg_unit = n_unit / n_bldg,
+            .groups = "keep") %>%
+  arrange(borough)
+
+avg_unit20_100y %>%
+  mutate(`Flood Zone` = ifelse(fz20_100y == 1, "In 100-year flood zone (2020)", "Not in flood zone")) %>%
+  ggplot() + 
+  aes(fill = `Flood Zone`, x = borough, y = avg_unit) + 
+  geom_col(position = "dodge")
+
+```
+
+
+
+
+# Secondary research question
+
+### Additional considerations related to housing
+
+##### Age
+-   age: how many old buildings are in the flood zone vs the rest of the city? 
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+countpct_age <- function(var) {
+  plutoan2 %>%
+    filter(res_flag == 1) %>% 
+    group_by({{var}} := eval(as.name(paste(var))), year_cat) %>%
+    summarise(count := n(),
+              .groups = "keep") %>%
+    ungroup() %>%
+    adorn_totals("row", fill = "ALL") %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    mutate(pct = count / sum(count)) 
+}
+  
+map(vars, countpct_age)
+
+```
+
+    --    how many old residential units (owned & rented) are in the flood zone vs. rest of city?
+    --    what % of old residential units are owned/rented in the flood zone vs. rest of city?
+    
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+unit_ctpct_age <- function(var){
+  plutoan2 %>%
+    filter(res_flag == 1) %>%
+    group_by({{var}} := eval(as.name(paste(var))), year_cat) %>%
+    summarise(n_own = sum(units_own, na.rm = TRUE),
+              n_rent = sum(units_rent, na.rm = TRUE),
+              n_tot = sum(units_res * res_flag, na.rm = TRUE),
+              .groups = "keep") %>%
+    ungroup() %>%
+    adorn_totals("row", fill = "NYC") %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    mutate(p_own = n_own / sum(n_own),
+           p_rent = n_rent / sum(n_rent))
+}
+  
+map(vars, unit_ctpct_age)
+
+```
+    
+    --    by borough, how many old units are in the flood zone vs. rest of city
+    --    by borough, what % of old residential units are owned/rented in the flood zone vs. rest of city?
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+unit_ctpct_age <- function(var){
+  plutoan2 %>%
+    filter(res_flag == 1) %>%
+    group_by({{var}} := eval(as.name(paste(var))), year_cat, borough) %>%
+    summarise(n_own = sum(units_own, na.rm = TRUE),
+              n_rent = sum(units_rent, na.rm = TRUE),
+              n_tot = sum(units_res * res_flag, na.rm = TRUE),
+              .groups = "keep") %>%
+    ungroup() %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    mutate(p_own = round(n_own / sum(n_own), digits = 4),
+           p_rent = round(n_rent / sum(n_rent), digits = 4),
+           p_tot = round(n_tot / sum(n_tot), digits = 4)) %>%
+    pivot_wider(id_cols = c(year_cat, borough), 
+                names_from = {{var}},
+                values_from = c(n_own, n_rent, n_tot, p_own, p_rent, p_tot)) %>%
+    arrange(borough) %>%
+    adorn_totals("row", fill = "NYC") 
+    # write_csv(file = file.path(csv, paste0({{var}},".csv")))
+}
+  
+map(vars, unit_ctpct_age)
+
+```
+
+# GRAPH: year_cat categories as a stacked bar graph
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y")
+
+  # plutoan2 %>%
+  #   filter(res_flag == 1) %>% 
+  #   group_by({{var}} := eval(as.name(paste(var))), year_cat) %>%
+  #   summarise(count := n(),
+  #             .groups = "keep") %>%
+  #   ungroup() %>%
+  #   adorn_totals("row", fill = "ALL") %>%
+  #   group_by({{var}} := eval(as.name(paste(var)))) %>%
+  #   mutate(pct = count / sum(count)) 
+
+unit_ctpct_age_g <- function(var){
+  grouped <- plutoan2 %>%
+    filter(res_flag == 1) %>%
+    group_by(fz := eval(as.name(paste(var))), year_cat) %>%
+    summarise(n_tot = n(),
+              .groups = "keep") %>%
+    ungroup() %>%
+    mutate(fz = case_when(
+      fz == "0" ~ "drop",
+      fz == "1" ~ {{var}},
+      fz == "Total" ~ {{var}}
+    )) %>%
+    group_by(fz) %>%
+    mutate(p_tot = round(n_tot / sum(n_tot), digits = 4))
+  
+  total <- plutoan2 %>%
+    filter(res_flag == 1) %>%
+    group_by(year_cat) %>%
+    summarise(n_tot = n(),
+              .groups = "keep") %>%
+    ungroup() %>%
+    mutate(p_tot = round(n_tot / sum(n_tot), digits = 4),
+           fz = "NYC")
+    
+  out <- bind_rows(grouped, total)
+  print(out)
+
+}
+  
+age_graph <- map_dfr(vars, unit_ctpct_age_g) %>%
+  distinct() %>%
+  filter(fz != "drop" & !is.na(year_cat)) %>%
+  mutate(fz_f = factor(fz, levels = c("NYC", "fz50_100y", "fz20_100y")),
+         year_cat_f = factor(year_cat, levels = c("since 2000", "1980 - 1999", "1960 - 1979", "before 1960")))
+
+plot <- age_graph %>%
+  ggplot() +
+  aes(x = fz_f, y = p_tot, fill = year_cat_f) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  scale_y_continuous(labels = scales::percent) + 
+  coord_flip() + 
+  theme_minimal()
+
+plot
+
+# ggsave(filename = file.path(out, "fig_yearcat.pdf"), plot, width = 18, height = 10, units = "in")
+
+```
+
+
+
+### Race and income in the flood zone
+-   race/ethnicity: what percent of the white/black/hispanic/asian/other population is in the fz?
+
+```{r}
+
+vars <- c("fzr20_100y", "fzr50_100y", "fzr50_500y")
+
+tract_ctpct_race <- function(var){
+  tractan2 %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    summarise(ntot = sum(poptot, na.rm = TRUE),
+              nwhit = sum(popwhit, na.rm = TRUE),
+              nblck = sum(popblck, na.rm = TRUE),
+              nhisp = sum(pophis, na.rm = TRUE),
+              nasin = sum(popasin, na.rm = TRUE)
+              ) %>%
+    ungroup() %>%
+    mutate(pwhit = nwhit/sum(nwhit),
+           pblck = nblck/sum(nblck),
+           phisp = nhisp/sum(nhisp),
+           pasin = nasin/sum(nasin)) %>%
+    adorn_totals("row")
+}
+
+map(vars, tract_ctpct_race)
+
+```
+
+    --    what are the racial/ethnic demographics of the fz compared to the rest of the city?
+
+```{r}
+
+vars <- c("fzr20_100y", "fzr50_100y", "fzr50_500y")
+
+tract_ctpct_race <- function(var){
+  tractan2 %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    summarise(ntot = sum(poptot, na.rm = TRUE),
+              nwhit = sum(popwhit, na.rm = TRUE),
+              nblck = sum(popblck, na.rm = TRUE),
+              nhisp = sum(pophis, na.rm = TRUE),
+              nasin = sum(popasin, na.rm = TRUE)
+              ) %>%
+    ungroup() %>%
+    adorn_totals("row") %>%
+    mutate(pwhit = nwhit/ntot,
+           pblck = nblck/ntot,
+           phisp = nhisp/ntot,
+           pasin = nasin/ntot)
+}
+
+map(vars, tract_ctpct_race)
+
+```
+
+-   by borough & fz, what percent of the total population is white/black/hispanic/asian?
+
+```{r}
+
+vars <- c("fzr20_100y", "fzr50_100y", "fzr50_500y")
+
+tract_ctpct_race <- function(var){
+  tractan2 %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(ntot = sum(poptot, na.rm = TRUE),
+              nwhit = sum(popwhit, na.rm = TRUE),
+              nblck = sum(popblck, na.rm = TRUE),
+              nhisp = sum(pophis, na.rm = TRUE),
+              nasin = sum(popasin, na.rm = TRUE),
+              .groups = "keep"
+              ) %>%
+    ungroup() %>%
+    adorn_totals("row", fill = "NYC") %>%
+    mutate(pwhit = nwhit/ntot,
+           pblck = nblck/ntot,
+           phisp = nhisp/ntot,
+           pasin = nasin/ntot) %>%
+    arrange(borough)
+}
+
+map(vars, tract_ctpct_race)
+
+```
+
+
+    --    what are the racial/ethnic demographics of the fz area compared to the rest of the borough?
+    
+```{r}
+
+vars <- c("fzr20_100y", "fzr50_100y", "fzr50_500y")
+
+tract_ctpct_race <- function(var){
+  tractan2 %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(ntot = sum(poptot, na.rm = TRUE),
+              nwhit = sum(popwhit, na.rm = TRUE),
+              nblck = sum(popblck, na.rm = TRUE),
+              nhisp = sum(pophis, na.rm = TRUE),
+              nasin = sum(popasin, na.rm = TRUE),
+              .groups = "keep"
+              ) %>%
+    ungroup() %>%
+    group_by(borough) %>%
+    mutate(pwhit = nwhit/sum(nwhit),
+           pblck = nblck/sum(nblck),
+           phisp = nhisp/sum(nhisp),
+           pasin = nasin/sum(nasin)) %>%
+    adorn_totals("row", fill = "NYC") %>%
+    arrange(borough)
+}
+
+map(vars, tract_ctpct_race)
+
+```
+
+
+## Income
+  -   What is the median household income in the fz and how does that compare to the rest of the city?
+  --   broken down by borough
+
+```{r}
+
+vars <- c("fzr20_100y", "fzr50_100y", "fzr50_500y")
+
+tract_hhinc <- function(var){
+  
+  totalrow <- tractan2 %>% 
+    summarise(mhhinc = weighted.mean(mhhinc, pophoh, na.rm = TRUE),
+              mhhinco = weighted.mean(mhhinco, pophoh, na.rm = TRUE),
+              mhhincr = weighted.mean(mhhincr, pophoh, na.rm = TRUE)) %>%
+    mutate({{var}} := "Total",
+           borough = "NYC") %>%
+    select({{var}}, borough, mhhinc, mhhinco, mhhincr)
+  
+  totalboro <- tractan2 %>% 
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    summarise(mhhinc = weighted.mean(mhhinc, pophoh, na.rm = TRUE),
+              mhhinco = weighted.mean(mhhinco, pophoh, na.rm = TRUE),
+              mhhincr = weighted.mean(mhhincr, pophoh, na.rm = TRUE)) %>%
+    mutate(borough = "NYC") %>%
+    select({{var}}, borough, mhhinc, mhhinco, mhhincr)
+  
+  tractan2 %>%
+    group_by({{var}} := eval(as.name(paste(var))), borough) %>%
+    summarise(mhhinc = weighted.mean(mhhinc, pophoh, na.rm = TRUE),
+              mhhinco = weighted.mean(mhhinco, pophoh, na.rm = TRUE),
+              mhhincr = weighted.mean(mhhincr, pophoh, na.rm = TRUE),
+              .groups = "keep") %>%
+    ungroup() %>%
+    rbind(totalboro, totalrow)
+}
+
+map(vars, tract_hhinc)
+
+```
+
+
+
+
+### Closer look at who those renters are
+-   NYCHA: count of residents in the flood zone and % of renters in fz (compared to citywide average)
+    --    NOTE that the PLUTO res counts for NYCHA are apparently undercounts and it's recommended to use data from somewhere else (ask Camille where).
+
+
+HK NOTE this code is incomplete, I can't find a straightforward way to join unit counts onto the mappluto data since the development names aren't very good at matching.
+```{r read in NYCHA unit data}
+
+nycha <- read_csv("https://raw.githubusercontent.com/JustFixNYC/nycha-scraper/098bd8232bee2cd59266bf278e26e32bd0cd7df1/Block-and-Lot-Guide-08272018.csv") %>%
+  clean_names()
+
+
+nychaddb <- read_csv("https://data.cityofnewyork.us/resource/evjd-dqpz.csv") %>%
+  clean_names()
+
+nychaddb2 <- nychaddb %>%
+  select(development) %>%
+  mutate(in_ddb = 1)
+
+plutoan3 <- plutoan2 %>%
+  filter(nycha == 1) %>%
+  select(development, in_mp) %>%
+  full_join(nychaddb2, by = "development")
+
+#check merge
+plutoan3 %>% count(in_ddb, in_mp)
+
+#check how many distinct development values were matched and remain unmatched
+plutoan3 %>%
+  group_by(in_ddb, in_mp) %>%
+  summarise(n = n(),
+            ndist = n_distinct(development))
+
+plutoan3 %>%
+  filter(is.na(in_ddb) | is.na(in_mp)) %>%
+  arrange(desc(in_mp), development)
+
+```
+
+
+
+```{r}
+
+# NOTE THIS IS INCOMPLETE AS I STILL NEED TO UPDATE THE UNITS_RES VARIABLE TO SOMETHING MORE RELIABLE FOR NYCHA
+
+plutoan2 %>%
+  filter(res_flag == 1) %>%
+  group_by(fz20_100y, nycha) %>%
+  summarise(ndevs = n_distinct(development, na.rm = TRUE))
+
+plutoan2 %>%
+  filter(res_flag == 1) %>%
+  group_by(fz20_100y, nycha) %>%
+  summarise(ntot = sum(units_res, na.rm = TRUE),
+            .groups = "keep") %>%
+  ungroup() %>%
+  group_by(fz20_100y) %>%
+  mutate(ptot = ntot / sum(ntot)) %>%
+  adorn_totals("row")
+
+plutoan2 %>%
+  filter(nycha == 1) %>%
+  group_by(development) %>%
+  mutate(flag = ifelse(max(fz20_100y) != min(fz20_100y), 1, 0)) %>%
+  filter(flag == 1) %>%
+  arrange(development) %>%
+  select(bbl, borough, development, fz20_100y) %>%
+  slice_head(n = 1)
+
+```
+
+
+-   HCV: count of vouchers used in flood zone census tracts vs non-fz census tracts (count and percent). Could also do % of renters who are voucher holders in a census tract within fz and non-fz census tracts (I think this var is on the HUD file)
+
+NOTE: Create an estimate of the total number of rental units in a census tract based on the ratio of HCV households to total rental units.
+
+```{r}
+
+trhcvan <- read_csv(file.path(csv, fil_h)) %>%
+  mutate(borocode = substr(ct2010, 1, 1),
+         borough = case_when(
+           borocode == "1" ~ "MN",
+           borocode == "2" ~ "BX",
+           borocode == "3" ~ "BK",
+           borocode == "4" ~ "QN",
+           borocode == "5" ~ "SI"
+         ),
+         rentest = hcv_public / hcv_pct_re * 100,
+         )
+  
+glimpse(trhcvan)
+
+
+# Gut checK: how similar do these rent estimates look?
+trhcvan %>% summarise(min = min(rentest, na.rm = TRUE), 
+                      max = max(rentest, na.rm = TRUE),
+                      avg = mean(rentest, na.rm = TRUE),
+                      med = median(rentest, na.rm = TRUE))
+
+tractan2 %>% summarise(min = min(nun_res, na.rm = TRUE), 
+                      max = max(nun_res, na.rm = TRUE),
+                      avg = mean(nun_res, na.rm = TRUE),
+                      med = median(nun_res, na.rm = TRUE))
+
+```
+
+```{r}
+
+vars <- c("fz20_100y", "fz50_100y", "fz50_500y")
+
+hcv_ctpct <- function(var){
+  tractan2 %>%
+    group_by({{var}} := eval(as.name(paste(var)))) %>%
+    summarise(ntot = sum(poptot, na.rm = TRUE),
+              nwhit = sum(popwhit, na.rm = TRUE),
+              nblck = sum(popblck, na.rm = TRUE),
+              nhisp = sum(pophis, na.rm = TRUE),
+              nasin = sum(popasin, na.rm = TRUE)
+              ) %>%
+    ungroup() %>%
+    adorn_totals("row") %>%
+    mutate(pwhit = nwhit/ntot,
+           pblck = nblck/ntot,
+           phisp = nhisp/ntot,
+           pasin = nasin/ntot)
+}
+
+hcv_ctpct <- function(var){
+trhcvan %>%
+  filter(!is.na(eval(as.name(paste(var))))) %>%
+  group_by({{var}} := eval(as.name(paste(var)))) %>%
+  summarise(nhcv = sum(hcv_public, na.rm = TRUE),
+            nrnt = sum(rentest, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(phcv = nhcv / sum(nhcv, na.rm = TRUE),
+         prnt = nrnt / sum(nrnt, na.rm = TRUE)) %>%
+  adorn_totals("row") 
+}
+
+map(vars, hcv_ctpct)
+
+```
+
+# TABLE: Census tract data for the datawrapper
+
+```{r}
+
+# glimpse(tractan2)
+
+# get_dupes(tractan2, name)
+
+tractdemo <- tractan2 %>%
+  mutate(pwhit = popwhit/poptot,
+         pblck = popblck/poptot,
+         phisp = pophis/poptot,
+         pasin = popasin/poptot,
+         poth  = 1 - (pwhit + pblck + phisp + pasin),
+         prent = poprntr/poptotl,
+         pownr = popownr/poptotl,
+         fz_cat = case_when(
+           fzr20_100y == 1 ~ "2020 100-year flood zone",
+           fzr50_100y == 1 ~ "2050 100-year flood zone",
+           TRUE ~ "Not in flood zone"
+         ),
+         #hardcode a few flood zone errors
+         fz_cat = case_when(
+           bct2020 == 3047400 ~ "Not in flood zone",
+           bct2020 == 3054400 ~ "Not in flood zone",
+           bct2020 == 4011200 ~ "Not in flood zone",
+           TRUE ~ fz_cat
+         ),
+         #create tract key using state and county codes
+         tract = substr(bct2020, 2, 7),
+         key = case_when(
+           borocode == "1" ~ paste0("061", tract),
+           borocode == "2" ~ paste0("005", tract),
+           borocode == "3" ~ paste0("047", tract),
+           borocode == "4" ~ paste0("081", tract),
+           borocode == "5" ~ paste0("085", tract))
+         ) %>%
+  select(name,
+         poptot,
+         pwhit,
+         pblck,
+         phisp,
+         pasin,
+         poth,
+         prent,
+         pownr,
+         mhhinc,
+         fz_cat,
+         fzr20_100y,
+         fzr50_100y,
+         bct2020,
+         tract,
+         key) 
+
+tractdemo %>%
+  mutate(racesum = pwhit + pblck + phisp + pasin + poth,
+         homeown = prent + pownr) %>%
+  count(racesum, homeown)
+
+tractdemo %>%
+  select(name, bct2020, tract, key) %>%
+  slice_sample(n=40)
+
+tractdemo %>%
+  count(fz_cat, fzr20_100y, fzr50_100y)
+
+# tractdemo %>%
+#   write_csv(file = file.path(csv, "tractdemo.csv"))
+         
+```
+
+
